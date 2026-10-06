@@ -1,10 +1,11 @@
 import sqlite3
 import datetime
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Request
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 app = FastAPI(title="Fuze Payment Gateway Operations Console")
+templates = Jinja2Templates(directory="templates")
 
 # --- SQLite Database Initialization ---
 def init_db():
@@ -47,7 +48,11 @@ class DisputeRequest(BaseModel):
     pod_reference: str
     merchant_notes: str
 
-# --- APIs ---
+# --- Endpoints ---
+@app.get("/")
+def index(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
 @app.post("/api/v1/mpgs/auth")
 def mpgs_auth(req: AuthRequest):
     timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -136,152 +141,3 @@ def get_ledger():
     rows = cursor.fetchall()
     conn.close()
     return [{"txn_id": r[0], "timestamp": r[1], "debited": r[2], "credited": r[3], "amount": r[4], "currency": r[5], "stage": r[6], "status": r[7]} for r in rows]
-
-# --- Live UI ---
-@app.get("/", response_class=HTMLResponse)
-def index():
-    return """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Fuze Payment Gateway Operations Console</title>
-        <script src="https://cdn.tailwindcss.com"></script>
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-        <style>
-            body { font-family: 'Plus Jakarta Sans', sans-serif; }
-            code, pre, .font-mono { font-family: 'JetBrains Mono', monospace; }
-            .glow-emerald { box-shadow: 0 0 25px -5px rgba(16, 185, 129, 0.3); }
-            .glow-indigo { box-shadow: 0 0 25px -5px rgba(99, 102, 241, 0.3); }
-        </style>
-    </head>
-    <body class="bg-[#0B0F17] text-slate-100 min-h-screen antialiased flex flex-col">
-
-        <!-- Top Header -->
-        <header class="border-b border-slate-800/80 bg-[#0F172A]/80 backdrop-blur-md px-6 py-3.5 sticky top-0 z-50 flex items-center justify-between">
-            <div class="flex items-center gap-4">
-                <div class="h-9 w-9 rounded-xl bg-gradient-to-tr from-indigo-600 to-violet-500 flex items-center justify-center font-bold text-white shadow-lg shadow-indigo-500/25">
-                    FZ
-                </div>
-                <div>
-                    <div class="flex items-center gap-2">
-                        <span class="text-sm font-semibold tracking-wide text-white">Fuze PG Operations & Scheme Engine</span>
-                        <span class="text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 font-medium">Enterprise Core</span>
-                    </div>
-                    <p class="text-xs text-slate-400">Card Acquiring, MPGS Switching & Mastercard Clearing Rails</p>
-                </div>
-            </div>
-            
-            <div class="flex items-center gap-3">
-                <div class="flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-medium">
-                    <span class="h-2 w-2 rounded-full bg-emerald-400 animate-ping"></span>
-                    Production Rails Live
-                </div>
-            </div>
-        </header>
-
-        <!-- Main Body -->
-        <main class="flex-1 max-w-7xl w-full mx-auto px-6 py-6 space-y-6">
-
-            <!-- Interactive Visual Pipeline Tracker -->
-            <div class="bg-gradient-to-b from-[#111827] to-[#0D131F] border border-slate-800 rounded-2xl p-6 shadow-xl relative overflow-hidden">
-                <div class="flex items-center justify-between mb-4">
-                    <div class="flex items-center gap-2">
-                        <span class="text-xs font-semibold uppercase tracking-wider text-indigo-400">Live Dual-Message Switch Topology</span>
-                    </div>
-                    <div id="topologyStatus" class="text-xs font-mono text-slate-400">STATUS: IDLE</div>
-                </div>
-
-                <div class="grid grid-cols-5 gap-3 relative z-10">
-                    <!-- Node 1 -->
-                    <div id="node-client" class="bg-slate-900/90 border border-slate-800 rounded-xl p-3.5 text-center transition-all duration-300">
-                        <div class="text-[10px] text-slate-400 font-mono mb-1">ORIGIN</div>
-                        <div class="text-xs font-bold text-slate-200">Customer App</div>
-                        <div class="text-[10px] text-slate-500 mt-0.5">3DS2 SDK / Web</div>
-                    </div>
-                    <!-- Node 2 -->
-                    <div id="node-mpgs" class="bg-slate-900/90 border border-slate-800 rounded-xl p-3.5 text-center transition-all duration-300">
-                        <div class="text-[10px] text-indigo-400 font-mono mb-1">GATEWAY</div>
-                        <div class="text-xs font-bold text-white">MPGS Switch</div>
-                        <div class="text-[10px] text-slate-400 mt-0.5">Token / Risk Check</div>
-                    </div>
-                    <!-- Node 3 -->
-                    <div id="node-acquirer" class="bg-slate-900/90 border border-slate-800 rounded-xl p-3.5 text-center transition-all duration-300">
-                        <div class="text-[10px] text-slate-400 font-mono mb-1">ACQUIRER</div>
-                        <div class="text-xs font-bold text-slate-200">Acquirer Bank</div>
-                        <div class="text-[10px] text-slate-500 mt-0.5">MID / TID Host</div>
-                    </div>
-                    <!-- Node 4 -->
-                    <div id="node-scheme" class="bg-slate-900/90 border border-slate-800 rounded-xl p-3.5 text-center transition-all duration-300">
-                        <div class="text-[10px] text-amber-400 font-mono mb-1">SCHEME</div>
-                        <div class="text-xs font-bold text-white">Mastercard Rail</div>
-                        <div class="text-[10px] text-slate-400 mt-0.5">Dual-Message ISO</div>
-                    </div>
-                    <!-- Node 5 -->
-                    <div id="node-issuer" class="bg-slate-900/90 border border-slate-800 rounded-xl p-3.5 text-center transition-all duration-300">
-                        <div class="text-[10px] text-slate-400 font-mono mb-1">ISSUER</div>
-                        <div class="text-xs font-bold text-slate-200">Issuer Bank</div>
-                        <div class="text-[10px] text-slate-500 mt-0.5">Auth / Lien Hold</div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Tabbed Operation Workbench -->
-            <div class="bg-[#111827] border border-slate-800 rounded-2xl shadow-xl overflow-hidden">
-                <!-- Nav Tabs -->
-                <div class="flex border-b border-slate-800 bg-slate-950/60 px-6 pt-3 gap-6 text-xs font-medium">
-                    <button onclick="switchTab('auth')" id="tab-btn-auth" class="pb-3 text-indigo-400 border-b-2 border-indigo-500 font-semibold transition">
-                        1. MPGS Authorization Switch
-                    </button>
-                    <button onclick="switchTab('clearing')" id="tab-btn-clearing" class="pb-3 text-slate-400 hover:text-slate-200 transition">
-                        2. Mastercard IPM Clearing Parser
-                    </button>
-                    <button onclick="switchTab('dispute')" id="tab-btn-dispute" class="pb-3 text-slate-400 hover:text-slate-200 transition">
-                        3. Chargeback Arbitration Desk
-                    </button>
-                </div>
-
-                <!-- Tab 1: MPGS Switch -->
-                <div id="tab-auth" class="p-6">
-                    <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
-                        <div class="space-y-4">
-                            <h3 class="text-sm font-semibold text-white">Trigger Switch Authorisation</h3>
-                            <p class="text-xs text-slate-400">Simulate incoming customer payment payloads and 3DS failure triage.</p>
-                            
-                            <div class="space-y-3">
-                                <div>
-                                    <label class="block text-xs font-medium text-slate-400 mb-1">Integration Flow</label>
-                                    <select id="authMode" class="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500">
-                                        <option value="HOSTED_CHECKOUT">Hosted Checkout Session (PCI SAQ A)</option>
-                                        <option value="DIRECT_API">Direct Server API (Network Tokenized)</option>
-                                    </select>
-                                </div>
-                                <div class="grid grid-cols-2 gap-3">
-                                    <div>
-                                        <label class="block text-xs font-medium text-slate-400 mb-1">Amount (USD)</label>
-                                        <input type="number" id="authAmt" value="184.00" class="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 font-mono">
-                                    </div>
-                                    <div>
-                                        <label class="block text-xs font-medium text-slate-400 mb-1">Masked Card</label>
-                                        <input type="text" id="authCard" value="5120-XXXX-XXXX-9931" class="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 font-mono" readonly>
-                                    </div>
-                                </div>
-
-                                <div class="p-3 bg-slate-900/60 border border-slate-800 rounded-xl flex items-center justify-between">
-                                    <div>
-                                        <div class="text-xs font-medium text-slate-200">Simulate 3DS Drop</div>
-                                        <div class="text-[11px] text-slate-500">Injects ISO 8583 0400 auto-reversal</div>
-                                    </div>
-                                    <input type="checkbox" id="authSimDrop" class="h-4 w-4 rounded bg-slate-950 border-slate-700 text-indigo-600 focus:ring-0">
-                                </div>
-
-                                <button onclick="runAuth()" class="w-full py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-medium text-xs shadow-lg shadow-indigo-600/25 transition">
-                                    Execute Authorisation Request
-                                </button>
-                            </div>
-                        </div>
-
-                        <!-- Switch
