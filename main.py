@@ -1,13 +1,12 @@
 import sqlite3
 import datetime
-import json
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="Fuze PG Operations & Scheme Engine")
+app = FastAPI(title="Fuze Payment Gateway Operations Console")
 
-# --- SQLite Double-Entry Database Initialization ---
+# --- SQLite Database Initialization ---
 def init_db():
     conn = sqlite3.connect("pg_ops_ledger.db")
     cursor = conn.cursor()
@@ -29,9 +28,9 @@ def init_db():
 
 init_db()
 
-# --- Pydantic Request Models ---
+# --- Models ---
 class AuthRequest(BaseModel):
-    integration_mode: str  # HOSTED_CHECKOUT or DIRECT_API
+    integration_mode: str
     card_pan_masked: str
     amount: float
     currency: str
@@ -43,33 +42,33 @@ class IPMParseRequest(BaseModel):
 
 class DisputeRequest(BaseModel):
     dispute_id: str
-    reason_code: str  # 4837 (Fraud) or 4853 (Service)
-    eci_flag: str     # 02/05 (3DS Success) or 07 (No 3DS)
+    reason_code: str
+    eci_flag: str
     pod_reference: str
     merchant_notes: str
 
-# --- API Endpoints ---
+# --- APIs ---
 @app.post("/api/v1/mpgs/auth")
 def mpgs_auth(req: AuthRequest):
-    timestamp = datetime.datetime.utcnow().isoformat() + "Z"
-    txn_id = f"MPGS_{int(datetime.datetime.utcnow().timestamp())}"
+    timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    txn_id = f"TXN_{int(datetime.datetime.utcnow().timestamp())}"
     
     if req.simulate_drop:
         return {
             "status": "FAILED",
-            "error_code": "3DS_CALLBACK_TIMEOUT",
-            "action_required": "POLL_RETRIEVE_ORDER_API",
-            "auto_reversal_fired": True,
-            "message": "ISO 8583 0400 Auto-Reversal dispatched to release customer funds hold."
+            "error_code": "3DS_TIMEOUT",
+            "iso_response": "91 (System Error / Timeout)",
+            "action": "AUTO_REVERSAL_0400",
+            "message": "3DS Callback dropped. Fired ISO 8583 0400 auto-reversal to release cardholder hold.",
+            "pipeline_nodes": ["client", "mpgs"]
         }
     
-    # Double-entry ledger recording
     conn = sqlite3.connect("pg_ops_ledger.db")
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO ledger_entries (txn_id, timestamp, account_debited, account_credited, amount, currency, lifecycle_stage, status)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (txn_id, timestamp, f"CARDHOLDER_{req.card_pan_masked}", "ACQUIRER_LIEN_HOLD", req.amount, req.currency, "AUTHORISATION", "HELD"))
+    """, (txn_id, timestamp, f"CARD_{req.card_pan_masked[-4:]}", "ACQUIRER_LIEN", req.amount, req.currency, "AUTHORISATION", "HELD"))
     conn.commit()
     conn.close()
 
@@ -78,55 +77,56 @@ def mpgs_auth(req: AuthRequest):
         "txn_id": txn_id,
         "rrn": f"RRN{int(datetime.datetime.utcnow().timestamp()*1000)}"[0:12],
         "iso_response": "00 (Approved)",
-        "3ds_eci": "05",
-        "ledger_state": "Lien hold placed on Issuer rails"
+        "3ds_eci": "05 (Liability Shift Confirmed)",
+        "message": "Funds authorized and held on Issuer rail.",
+        "pipeline_nodes": ["client", "mpgs", "acquirer", "scheme", "issuer"]
     }
 
 @app.post("/api/v1/clearing/parse-ipm")
 def parse_ipm(req: IPMParseRequest):
-    raw = req.raw_ipm_record.strip()
-    gross_amount = 184.00
+    gross = 184.00
     interchange = 2.17
     scheme_fee = 0.29
-    net_merchant_payout = round(gross_amount - interchange - scheme_fee, 2)
+    net_payout = round(gross - interchange - scheme_fee, 2)
     
     return {
         "record_type": "PDS-0200 Presentment Record",
-        "network": "Mastercard Dual-Message Rail",
-        "gross_presentment_usd": gross_amount,
-        "interchange_rate_calculated": f"${interchange} (1.18%)",
-        "mastercard_scheme_assessment": f"${scheme_fee} (0.16%)",
-        "net_merchant_settlement": f"${net_merchant_payout}",
-        "recon_status": "MATCHED (ISO Auth == IPM Presentment)",
-        "clearing_window": "DC1_SETTLEMENT_BATCH"
+        "gross_amount": f"${gross:.2f}",
+        "interchange": f"${interchange:.2f} (1.18%)",
+        "scheme_fee": f"${scheme_fee:.2f} (0.16%)",
+        "net_payout": f"${net_payout:.2f}",
+        "recon_status": "MATCHED",
+        "clearing_cycle": "Mastercard Dual-Message EOD Batch"
     }
 
 @app.post("/api/v1/dispute/representment")
 def dispute_representment(req: DisputeRequest):
-    liability_shift = False
-    verdict = ""
-    
     if req.reason_code == "4837":
         if req.eci_flag in ["02", "05"]:
-            liability_shift = True
-            verdict = "REPRESENTMENT WON: Liability shift confirmed via 3DS CAVV/ECI flag. Issuer absorbs fraud loss."
+            return {
+                "outcome": "LIABILITY SHIFT WON",
+                "badge": "bg-emerald-500/20 text-emerald-400 border-emerald-500/40",
+                "details": "Liability shift validated via 3DS CAVV/ECI signature. Issuer absorbs fraud loss under Mastercard Scheme rules."
+            }
         else:
-            liability_shift = False
-            verdict = "MERCHANT LIABLE: No 3DS OTP challenge recorded (ECI 07). Compelling evidence insufficient."
-    elif req.reason_code == "4853":
+            return {
+                "outcome": "MERCHANT LIABLE",
+                "badge": "bg-rose-500/20 text-rose-400 border-rose-500/40",
+                "details": "Non-3DS transaction (ECI 07). Merchant absorbs chargeback fee and transaction debit."
+            }
+    else:
         if req.pod_reference and len(req.pod_reference) > 5:
-            liability_shift = True
-            verdict = "REPRESENTMENT SUBMITTED: Valid Courier POD & Signed Delivery receipt attached. Sent to Pre-Arbitration."
+            return {
+                "outcome": "REPRESENTMENT DISPATCHED",
+                "badge": "bg-sky-500/20 text-sky-400 border-sky-500/40",
+                "details": "Courier POD and tracking documentation attached. File escalated to Pre-Arbitration stage."
+            }
         else:
-            verdict = "EVIDENCE REJECTED: Missing tracking slip / POD reference."
-            
-    return {
-        "dispute_id": req.dispute_id,
-        "reason_code": req.reason_code,
-        "liability_shift_secured": liability_shift,
-        "verdict": verdict,
-        "tat_status": "Within 30-Day Scheme Window"
-    }
+            return {
+                "outcome": "REPRESENTMENT REJECTED",
+                "badge": "bg-amber-500/20 text-amber-400 border-amber-500/40",
+                "details": "Missing valid courier delivery reference. Proof rejected."
+            }
 
 @app.get("/api/v1/ledger/recent")
 def get_ledger():
@@ -135,256 +135,153 @@ def get_ledger():
     cursor.execute("SELECT txn_id, timestamp, account_debited, account_credited, amount, currency, lifecycle_stage, status FROM ledger_entries ORDER BY id DESC LIMIT 5")
     rows = cursor.fetchall()
     conn.close()
-    
-    entries = []
-    for r in rows:
-        entries.append({
-            "txn_id": r[0], "timestamp": r[1], "debited": r[2], "credited": r[3],
-            "amount": r[4], "currency": r[5], "stage": r[6], "status": r[7]
-        })
-    return entries
+    return [{"txn_id": r[0], "timestamp": r[1], "debited": r[2], "credited": r[3], "amount": r[4], "currency": r[5], "stage": r[6], "status": r[7]} for r in rows]
 
-# --- Interactive Visual Dashboard UI ---
+# --- Live UI ---
 @app.get("/", response_class=HTMLResponse)
-def dashboard():
+def index():
     return """
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Fuze PG Operations & Scheme Engine</title>
+        <title>Fuze Payment Gateway Operations Console</title>
         <script src="https://cdn.tailwindcss.com"></script>
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
         <style>
-            @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;500;600;700&display=swap');
-            body { font-family: 'Inter', sans-serif; }
-            pre, code { font-family: 'JetBrains Mono', monospace; }
+            body { font-family: 'Plus Jakarta Sans', sans-serif; }
+            code, pre, .font-mono { font-family: 'JetBrains Mono', monospace; }
+            .glow-emerald { box-shadow: 0 0 25px -5px rgba(16, 185, 129, 0.3); }
+            .glow-indigo { box-shadow: 0 0 25px -5px rgba(99, 102, 241, 0.3); }
         </style>
     </head>
-    <body class="bg-slate-950 text-slate-100 min-h-screen">
-        <!-- Top Nav -->
-        <header class="border-b border-slate-800 bg-slate-900/60 backdrop-blur px-6 py-4 flex items-center justify-between sticky top-0 z-50">
-            <div class="flex items-center space-x-3">
-                <div class="w-9 h-9 rounded-lg bg-indigo-600 flex items-center justify-center font-bold text-white shadow-lg shadow-indigo-600/30">FZ</div>
+    <body class="bg-[#0B0F17] text-slate-100 min-h-screen antialiased flex flex-col">
+
+        <!-- Top Header -->
+        <header class="border-b border-slate-800/80 bg-[#0F172A]/80 backdrop-blur-md px-6 py-3.5 sticky top-0 z-50 flex items-center justify-between">
+            <div class="flex items-center gap-4">
+                <div class="h-9 w-9 rounded-xl bg-gradient-to-tr from-indigo-600 to-violet-500 flex items-center justify-center font-bold text-white shadow-lg shadow-indigo-500/25">
+                    FZ
+                </div>
                 <div>
-                    <h1 class="text-base font-semibold text-white tracking-wide">Fuze Payment Gateway Operations Console</h1>
-                    <p class="text-xs text-slate-400">Card Acquiring, MPGS & Mastercard Clearing Infrastructure</p>
+                    <div class="flex items-center gap-2">
+                        <span class="text-sm font-semibold tracking-wide text-white">Fuze PG Operations & Scheme Engine</span>
+                        <span class="text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 font-medium">Enterprise Core</span>
+                    </div>
+                    <p class="text-xs text-slate-400">Card Acquiring, MPGS Switching & Mastercard Clearing Rails</p>
                 </div>
             </div>
-            <div class="flex items-center space-x-4">
-                <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-950 text-emerald-400 border border-emerald-800">
-                    <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1.5 animate-pulse"></span> Switch Live
-                </span>
-                <span class="text-xs text-slate-400 border-l border-slate-800 pl-4">Dual-Message Active</span>
+            
+            <div class="flex items-center gap-3">
+                <div class="flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-medium">
+                    <span class="h-2 w-2 rounded-full bg-emerald-400 animate-ping"></span>
+                    Production Rails Live
+                </div>
             </div>
         </header>
 
-        <main class="max-w-7xl mx-auto px-6 py-8 space-y-8">
-            <!-- Grid 1: Pipeline Switch & Settlement -->
-            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                <!-- Box 1: MPGS Switch Simulator -->
-                <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl">
-                    <div class="flex items-center justify-between pb-4 border-b border-slate-800">
-                        <div class="flex items-center space-x-2">
-                            <span class="px-2 py-0.5 rounded bg-indigo-900/50 text-indigo-400 font-mono text-xs border border-indigo-700">MODULE 01</span>
-                            <h2 class="text-sm font-semibold text-white">MPGS Auth & Recovery Engine</h2>
-                        </div>
-                        <span class="text-xs text-slate-400">ISO 8583 0100/0110</span>
+        <!-- Main Body -->
+        <main class="flex-1 max-w-7xl w-full mx-auto px-6 py-6 space-y-6">
+
+            <!-- Interactive Visual Pipeline Tracker -->
+            <div class="bg-gradient-to-b from-[#111827] to-[#0D131F] border border-slate-800 rounded-2xl p-6 shadow-xl relative overflow-hidden">
+                <div class="flex items-center justify-between mb-4">
+                    <div class="flex items-center gap-2">
+                        <span class="text-xs font-semibold uppercase tracking-wider text-indigo-400">Live Dual-Message Switch Topology</span>
                     </div>
-
-                    <div class="mt-4 space-y-4 text-xs">
-                        <div class="grid grid-cols-2 gap-3">
-                            <div>
-                                <label class="text-slate-400 block mb-1">Integration Mode</label>
-                                <select id="authMode" class="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-white">
-                                    <option value="HOSTED_CHECKOUT">Hosted Checkout (PCI SAQ A)</option>
-                                    <option value="DIRECT_API">Direct Server API (Tokenized)</option>
-                                </select>
-                            </div>
-                            <div>
-                                <label class="text-slate-400 block mb-1">Gross Amount (USD)</label>
-                                <input id="authAmount" type="number" value="184.00" class="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-white font-mono">
-                            </div>
-                        </div>
-
-                        <div class="flex items-center space-x-2 bg-slate-950/60 p-2.5 rounded border border-slate-800/80">
-                            <input id="authDrop" type="checkbox" class="rounded bg-slate-900 border-slate-700 text-indigo-600 focus:ring-0">
-                            <label for="authDrop" class="text-slate-300">Simulate 3DS Callback Drop (Ghost Order Triage)</label>
-                        </div>
-
-                        <button onclick="triggerAuth()" class="w-full py-2 bg-indigo-600 hover:bg-indigo-500 rounded font-medium text-white transition shadow-lg shadow-indigo-600/20">
-                            Execute Switch Request
-                        </button>
-
-                        <div class="bg-slate-950 rounded p-3 border border-slate-800/80">
-                            <div class="text-[11px] text-slate-400 mb-1 flex justify-between font-mono">
-                                <span>TERMINAL_OUTPUT</span>
-                                <span id="authStatusBadge">IDLE</span>
-                            </div>
-                            <pre id="authOutput" class="text-[11px] text-emerald-400 overflow-x-auto whitespace-pre-wrap">Awaiting transaction execution...</pre>
-                        </div>
-                    </div>
+                    <div id="topologyStatus" class="text-xs font-mono text-slate-400">STATUS: IDLE</div>
                 </div>
 
-                <!-- Box 2: Mastercard IPM Parser -->
-                <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl">
-                    <div class="flex items-center justify-between pb-4 border-b border-slate-800">
-                        <div class="flex items-center space-x-2">
-                            <span class="px-2 py-0.5 rounded bg-amber-900/50 text-amber-400 font-mono text-xs border border-amber-700">MODULE 02</span>
-                            <h2 class="text-sm font-semibold text-white">Mastercard IPM Clearing Parser</h2>
-                        </div>
-                        <span class="text-xs text-slate-400">PDS-0200 Presentment</span>
+                <div class="grid grid-cols-5 gap-3 relative z-10">
+                    <!-- Node 1 -->
+                    <div id="node-client" class="bg-slate-900/90 border border-slate-800 rounded-xl p-3.5 text-center transition-all duration-300">
+                        <div class="text-[10px] text-slate-400 font-mono mb-1">ORIGIN</div>
+                        <div class="text-xs font-bold text-slate-200">Customer App</div>
+                        <div class="text-[10px] text-slate-500 mt-0.5">3DS2 SDK / Web</div>
                     </div>
-
-                    <div class="mt-4 space-y-4 text-xs">
-                        <div>
-                            <label class="text-slate-400 block mb-1">EOD IPM Presentment Record (.DAT snippet)</label>
-                            <textarea id="ipmInput" rows="2" class="w-full bg-slate-950 border border-slate-800 rounded p-2 text-slate-300 font-mono text-[11px]">REC_PDS0200|MC_DUAL_MSG|MID_8849201|AUTH_184.00|USD|ECI_05|RRN_392019481029|MCC_5411</textarea>
-                        </div>
-
-                        <button onclick="parseIPM()" class="w-full py-2 bg-amber-600 hover:bg-amber-500 rounded font-medium text-white transition shadow-lg shadow-amber-600/20">
-                            Parse & Audit Clearing Batch
-                        </button>
-
-                        <div class="bg-slate-950 rounded p-3 border border-slate-800/80">
-                            <div class="text-[11px] text-slate-400 mb-1 font-mono">CALCULATED_SETTLEMENT_LEDGER</div>
-                            <pre id="ipmOutput" class="text-[11px] text-amber-300 overflow-x-auto whitespace-pre-wrap">Click to audit IPM presentment fees...</pre>
-                        </div>
+                    <!-- Node 2 -->
+                    <div id="node-mpgs" class="bg-slate-900/90 border border-slate-800 rounded-xl p-3.5 text-center transition-all duration-300">
+                        <div class="text-[10px] text-indigo-400 font-mono mb-1">GATEWAY</div>
+                        <div class="text-xs font-bold text-white">MPGS Switch</div>
+                        <div class="text-[10px] text-slate-400 mt-0.5">Token / Risk Check</div>
+                    </div>
+                    <!-- Node 3 -->
+                    <div id="node-acquirer" class="bg-slate-900/90 border border-slate-800 rounded-xl p-3.5 text-center transition-all duration-300">
+                        <div class="text-[10px] text-slate-400 font-mono mb-1">ACQUIRER</div>
+                        <div class="text-xs font-bold text-slate-200">Acquirer Bank</div>
+                        <div class="text-[10px] text-slate-500 mt-0.5">MID / TID Host</div>
+                    </div>
+                    <!-- Node 4 -->
+                    <div id="node-scheme" class="bg-slate-900/90 border border-slate-800 rounded-xl p-3.5 text-center transition-all duration-300">
+                        <div class="text-[10px] text-amber-400 font-mono mb-1">SCHEME</div>
+                        <div class="text-xs font-bold text-white">Mastercard Rail</div>
+                        <div class="text-[10px] text-slate-400 mt-0.5">Dual-Message ISO</div>
+                    </div>
+                    <!-- Node 5 -->
+                    <div id="node-issuer" class="bg-slate-900/90 border border-slate-800 rounded-xl p-3.5 text-center transition-all duration-300">
+                        <div class="text-[10px] text-slate-400 font-mono mb-1">ISSUER</div>
+                        <div class="text-xs font-bold text-slate-200">Issuer Bank</div>
+                        <div class="text-[10px] text-slate-500 mt-0.5">Auth / Lien Hold</div>
                     </div>
                 </div>
             </div>
 
-            <!-- Grid 2: Chargeback Arbitration Desk -->
-            <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl">
-                <div class="flex items-center justify-between pb-4 border-b border-slate-800">
-                    <div class="flex items-center space-x-2">
-                        <span class="px-2 py-0.5 rounded bg-rose-900/50 text-rose-400 font-mono text-xs border border-rose-700">MODULE 03</span>
-                        <h2 class="text-sm font-semibold text-white">Chargeback Arbitration Desk (TAT & Defense Engine)</h2>
-                    </div>
-                    <span class="text-xs text-rose-400">30-Day Scheme Window</span>
+            <!-- Tabbed Operation Workbench -->
+            <div class="bg-[#111827] border border-slate-800 rounded-2xl shadow-xl overflow-hidden">
+                <!-- Nav Tabs -->
+                <div class="flex border-b border-slate-800 bg-slate-950/60 px-6 pt-3 gap-6 text-xs font-medium">
+                    <button onclick="switchTab('auth')" id="tab-btn-auth" class="pb-3 text-indigo-400 border-b-2 border-indigo-500 font-semibold transition">
+                        1. MPGS Authorization Switch
+                    </button>
+                    <button onclick="switchTab('clearing')" id="tab-btn-clearing" class="pb-3 text-slate-400 hover:text-slate-200 transition">
+                        2. Mastercard IPM Clearing Parser
+                    </button>
+                    <button onclick="switchTab('dispute')" id="tab-btn-dispute" class="pb-3 text-slate-400 hover:text-slate-200 transition">
+                        3. Chargeback Arbitration Desk
+                    </button>
                 </div>
 
-                <div class="mt-4 grid grid-cols-1 md:grid-cols-3 gap-6 text-xs">
-                    <div class="space-y-3">
-                        <div>
-                            <label class="text-slate-400 block mb-1">Chargeback Reason Code</label>
-                            <select id="cbReason" class="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-white">
-                                <option value="4837">Reason 4837 (Fraud / No Auth)</option>
-                                <option value="4853">Reason 4853 (Goods/Service Not Received)</option>
-                            </select>
+                <!-- Tab 1: MPGS Switch -->
+                <div id="tab-auth" class="p-6">
+                    <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                        <div class="space-y-4">
+                            <h3 class="text-sm font-semibold text-white">Trigger Switch Authorisation</h3>
+                            <p class="text-xs text-slate-400">Simulate incoming customer payment payloads and 3DS failure triage.</p>
+                            
+                            <div class="space-y-3">
+                                <div>
+                                    <label class="block text-xs font-medium text-slate-400 mb-1">Integration Flow</label>
+                                    <select id="authMode" class="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500">
+                                        <option value="HOSTED_CHECKOUT">Hosted Checkout Session (PCI SAQ A)</option>
+                                        <option value="DIRECT_API">Direct Server API (Network Tokenized)</option>
+                                    </select>
+                                </div>
+                                <div class="grid grid-cols-2 gap-3">
+                                    <div>
+                                        <label class="block text-xs font-medium text-slate-400 mb-1">Amount (USD)</label>
+                                        <input type="number" id="authAmt" value="184.00" class="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 font-mono">
+                                    </div>
+                                    <div>
+                                        <label class="block text-xs font-medium text-slate-400 mb-1">Masked Card</label>
+                                        <input type="text" id="authCard" value="5120-XXXX-XXXX-9931" class="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 font-mono" readonly>
+                                    </div>
+                                </div>
+
+                                <div class="p-3 bg-slate-900/60 border border-slate-800 rounded-xl flex items-center justify-between">
+                                    <div>
+                                        <div class="text-xs font-medium text-slate-200">Simulate 3DS Drop</div>
+                                        <div class="text-[11px] text-slate-500">Injects ISO 8583 0400 auto-reversal</div>
+                                    </div>
+                                    <input type="checkbox" id="authSimDrop" class="h-4 w-4 rounded bg-slate-950 border-slate-700 text-indigo-600 focus:ring-0">
+                                </div>
+
+                                <button onclick="runAuth()" class="w-full py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-medium text-xs shadow-lg shadow-indigo-600/25 transition">
+                                    Execute Authorisation Request
+                                </button>
+                            </div>
                         </div>
-                        <div>
-                            <label class="text-slate-400 block mb-1">3DS ECI Authentication Flag</label>
-                            <select id="cbEci" class="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-white">
-                                <option value="05">ECI 05 (Fully Authenticated 3DS OTP)</option>
-                                <option value="02">ECI 02 (Mastercard Identity Check Success)</option>
-                                <option value="07">ECI 07 (Non-3DS / Merchant Liable)</option>
-                            </select>
-                        </div>
-                    </div>
 
-                    <div class="space-y-3">
-                        <div>
-                            <label class="text-slate-400 block mb-1">Courier POD / Tracking Receipt Reference</label>
-                            <input id="cbPod" type="text" value="BLUEDART_POD_9948201_SIGNED" class="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-white font-mono">
-                        </div>
-                        <div>
-                            <label class="text-slate-400 block mb-1">Merchant Compelling Notes</label>
-                            <input id="cbNotes" type="text" value="Customer IP matching delivery postal pin; signed receipt attached." class="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-white">
-                        </div>
-                    </div>
-
-                    <div class="flex flex-col justify-between">
-                        <div>
-                            <span class="text-slate-400 block mb-1">Action</span>
-                            <button onclick="submitDispute()" class="w-full py-2 bg-rose-600 hover:bg-rose-500 rounded font-medium text-white transition shadow-lg shadow-rose-600/20 mb-3">
-                                Dispatch Representment File
-                            </button>
-                        </div>
-                        <div class="bg-slate-950 p-3 rounded border border-slate-800">
-                            <span class="text-[10px] text-slate-500 block mb-1 font-mono">ARBITRATION_VERDICT</span>
-                            <p id="cbVerdict" class="text-xs text-rose-300 font-mono">Ready to process claim rebuttal.</p>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </main>
-
-        <script>
-            async function triggerAuth() {
-                const mode = document.getElementById('authMode').value;
-                const amt = parseFloat(document.getElementById('authAmount').value);
-                const drop = document.getElementById('authDrop').checked;
-                const out = document.getElementById('authOutput');
-                const badge = document.getElementById('authStatusBadge');
-                
-                badge.innerText = 'PROCESSING...';
-                badge.className = 'text-amber-400 font-mono';
-
-                try {
-                    const res = await fetch('/api/v1/mpgs/auth', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({
-                            integration_mode: mode,
-                            card_pan_masked: '5120-XXXX-XXXX-9931',
-                            amount: amt,
-                            currency: 'USD',
-                            merchant_id: 'FUZE_MID_9019',
-                            simulate_drop: drop
-                        })
-                    });
-                    const data = await res.json();
-                    out.innerText = JSON.stringify(data, null, 2);
-                    badge.innerText = data.status;
-                    badge.className = data.status === 'APPROVED' ? 'text-emerald-400 font-mono' : 'text-rose-400 font-mono';
-                } catch(e) {
-                    out.innerText = 'Error: ' + e;
-                }
-            }
-
-            async function parseIPM() {
-                const raw = document.getElementById('ipmInput').value;
-                const out = document.getElementById('ipmOutput');
-                try {
-                    const res = await fetch('/api/v1/clearing/parse-ipm', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ raw_ipm_record: raw })
-                    });
-                    const data = await res.json();
-                    out.innerText = JSON.stringify(data, null, 2);
-                } catch(e) {
-                    out.innerText = 'Error: ' + e;
-                }
-            }
-
-            async function submitDispute() {
-                const reason = document.getElementById('cbReason').value;
-                const eci = document.getElementById('cbEci').value;
-                const pod = document.getElementById('cbPod').value;
-                const notes = document.getElementById('cbNotes').value;
-                const verdict = document.getElementById('cbVerdict');
-
-                try {
-                    const res = await fetch('/api/v1/dispute/representment', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({
-                            dispute_id: 'DSP_92019482',
-                            reason_code: reason,
-                            eci_flag: eci,
-                            pod_reference: pod,
-                            merchant_notes: notes
-                        })
-                    });
-                    const data = await res.json();
-                    verdict.innerText = data.verdict;
-                } catch(e) {
-                    verdict.innerText = 'Error: ' + e;
-                }
-            }
-        </script>
-    </body>
-    </html>
-    """
+                        <!-- Switch
