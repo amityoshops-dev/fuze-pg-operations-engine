@@ -1,15 +1,21 @@
+import os
 import sqlite3
 import datetime
-from fastapi import FastAPI, Request
-from fastapi.templating import Jinja2Templates
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="Fuze Payment Gateway Operations Console")
-templates = Jinja2Templates(directory="templates")
+
+# --- Absolute Path Setup for HTML ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMPLATE_PATH = os.path.join(BASE_DIR, "templates", "index.html")
 
 # --- SQLite Database Initialization ---
+DB_PATH = os.path.join(BASE_DIR, "pg_ops_ledger.db")
+
 def init_db():
-    conn = sqlite3.connect("pg_ops_ledger.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS ledger_entries (
@@ -48,11 +54,19 @@ class DisputeRequest(BaseModel):
     pod_reference: str
     merchant_notes: str
 
-# --- Endpoints ---
-@app.get("/")
-def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+# --- Root HTML Endpoint (Bulletproof File Loader) ---
+@app.get("/", response_class=HTMLResponse)
+def index():
+    if os.path.exists(TEMPLATE_PATH):
+        with open(TEMPLATE_PATH, "r", encoding="utf-8") as f:
+            return f.read()
+    elif os.path.exists("index.html"):
+        with open("index.html", "r", encoding="utf-8") as f:
+            return f.read()
+    else:
+        return "<h3>Error: index.html not found. Please ensure index.html is in the templates/ folder.</h3>"
 
+# --- Switch & Clearing Endpoints ---
 @app.post("/api/v1/mpgs/auth")
 def mpgs_auth(req: AuthRequest):
     timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -68,7 +82,7 @@ def mpgs_auth(req: AuthRequest):
             "pipeline_nodes": ["client", "mpgs"]
         }
     
-    conn = sqlite3.connect("pg_ops_ledger.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO ledger_entries (txn_id, timestamp, account_debited, account_credited, amount, currency, lifecycle_stage, status)
@@ -135,7 +149,7 @@ def dispute_representment(req: DisputeRequest):
 
 @app.get("/api/v1/ledger/recent")
 def get_ledger():
-    conn = sqlite3.connect("pg_ops_ledger.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT txn_id, timestamp, account_debited, account_credited, amount, currency, lifecycle_stage, status FROM ledger_entries ORDER BY id DESC LIMIT 5")
     rows = cursor.fetchall()
